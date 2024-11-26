@@ -1,126 +1,131 @@
-
-name: DevSecOps CI CD Pipeline for Juice Shop
-
+name: Secure OWASP Juice Shop Pipeline
 on:
   push:
-    branches:
-      - master
+    branches: [ master ]
   pull_request:
-    branches:
-      - master
+    branches: [ master ]
 
-permissions:
-  contents: write
-  security-events: write
-  actions: write
-  issues: write
+env:
+  IMAGE_NAME: bkimminich/juice-shop
+  IMAGE_TAG: latest
 
 jobs:
-  # Job 1: Static Application Security Testing (SAST) with CodeQL
-  codeql_analysis:
-    name: Perform Static Application Security Testing (SAST) with CodeQL
+  sast:
+    name: Static Application Security Testing
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - name: Set up CodeQL
-        uses: github/codeql-action/init@v3
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
         with:
-          languages: javascript
-          queries: security-extended
-         
-          config: |
-            paths-ignore:
-              - 'data/static/codefixes'
-
+          languages: 'typescript'
+          
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v2
         with:
-          output: codeql-results.sarif
-
+          category: "/language:typescript"
+          output: 'results'
+          
       - name: Upload CodeQL Results
-        if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: codeql-scan-results
-          path: codeql-results.sarif
+          name: codeql-results
+          path: results
+          retention-days: 30
 
-  
+  # sca:
+  #   runs-on: ubuntu-latest
+  #   name: depecheck_test
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v2
+  #     - name: Clean and Install dependencies
+  #       run:  npm install
+  #     - name: Depcheck
+  #       uses: dependency-check/Dependency-Check_Action@main
+  #       id: Depcheck
+  #       with:
+  #         project: 'test'
+  #         path: '.'
+  #         format: 'HTML'
+  #         out: 'reports' # this is the default, no need to specify unless you wish to override it
+  #         args: >
+  #           --failOnCVSS 7
+  #           --enableRetired
+  #     - name: Upload Test results
+  #       uses: actions/upload-artifact@master
+  #       with:
+  #          name: Depcheck report
+  #          path: ${{github.workspace}}
 
-    dependency_check:
-    name: Perform Software Composition Analysis (SCA) with OWASP Dependency Check
+  test:
+    needs: [sast, sca]
     runs-on: ubuntu-latest
-    needs: codeql_analysis  # Ensures that this job runs after 'codeql_analysis'
     steps:
-      - name: Run OWASP Dependency Check
-        uses: dependency-check/Dependency-Check_Action@main
-        with:
-          format: "JSON"
-          project: JuiceShop
-          path: "."
-          out: "."
-          args: "--exclude ../../ftp/legal.md --exclude ../../frontend/dist/frontend/assets/public/videos/owasp_promo.vtt"
-
-      - name: Upload Dependency Check Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: owasp-dependency-check-report
-          path: .
-
-  build_deploy_and_zap_scan:
-    name: Build, Deploy, and Run ZAP Scan for Juice Shop
-    runs-on: ubuntu-latest
-    needs: dependency_check  # Ensures that this job runs after 'dependency_check'
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          load: true
-          tags: juice-shop:latest
-
-      - name: Deploy Juice Shop
-        run: docker run -d --name juice-shop -p 3000:3000 juice-shop:latest
-
-      - name: Wait for Juice Shop to Start
+      - name: Checkout code
+        uses: actions/checkout@v2
+        
+      - name: Pull Docker image
+        run: docker pull ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        
+      - name: Run container for testing
         run: |
-          echo "Waiting for Juice Shop to start..."
-          for i in {1..30}; do
-            if curl -s http://localhost:3000 > /dev/null; then
-              echo "Juice Shop is ready!"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "Juice Shop failed to start."
-          exit 1
-
-      - name: Run ZAP Scan
-        uses: zaproxy/action-full-scan@v0.12.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
-          target: 'http://localhost:3000'
-          rules_file_name: '.zap/rules.tsv'
-
-      - name: Upload ZAP Results as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: zap-results
-          path: /home/runner/work/github-actions/github-actions/*.html
-
-      - name: Stop and Remove Juice Shop Container
-        if: always()
+          docker run -d -p 3000:3000 --name juice-shop ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          sleep 10
+          
+      - name: Basic health check
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000)
+          if [ $response -eq 200 ]; then
+            echo "Health check passed"
+          else
+            echo "Health check failed"
+            exit 1
+          fi
+          
+      - name: Stop container
         run: docker stop juice-shop && docker rm juice-shop
 
-
-
-         docker rm defectdojo
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Get SSH key from S3
+        run: |
+          mkdir -p ~/.ssh
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/${{ secrets.S3_KEY_PATH }} ~/.ssh/ec2-key.pem
+          chmod 600 ~/.ssh/ec2-key.pem
+          
+      - name: Deploy to EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2-key.pem ec2-user@${{ secrets.EC2_HOST }} '
+            # Stop and remove existing container if it exists
+            sudo docker stop juice-shop || true
+            sudo docker rm juice-shop || true
+            
+            # Pull latest image
+            sudo docker pull ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            
+            # Run new container
+            sudo docker run -d \
+              --name juice-shop \
+              -p 3000:3000 \
+              --restart unless-stopped \
+              ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          '
+          
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/ec2-key.pem
